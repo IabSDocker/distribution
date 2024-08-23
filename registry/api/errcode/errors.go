@@ -147,7 +147,7 @@ type ErrorDescriptor struct {
 	// keyed value when serializing api errors.
 	Value string
 
-	// Message is a short, human readable decription of the error condition
+	// Message is a short, human readable description of the error condition
 	// included in API responses.
 	Message string
 
@@ -224,11 +224,20 @@ func (errs Errors) MarshalJSON() ([]byte, error) {
 			msg = err.Code.Message()
 		}
 
-		tmpErrs.Errors = append(tmpErrs.Errors, Error{
+		tmpErr := Error{
 			Code:    err.Code,
 			Message: msg,
 			Detail:  err.Detail,
-		})
+		}
+
+		// if the detail contains error extract the error message
+		// otherwise json.Marshal will not serialize it at all
+		// https://github.com/golang/go/issues/10748
+		if detail, ok := tmpErr.Detail.(error); ok {
+			tmpErr.Detail = detail.Error()
+		}
+
+		tmpErrs.Errors = append(tmpErrs.Errors, tmpErr)
 	}
 
 	return json.Marshal(tmpErrs)

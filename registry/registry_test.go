@@ -13,7 +13,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -24,8 +24,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/distribution/configuration"
-	_ "github.com/docker/distribution/registry/storage/driver/inmemory"
+	"github.com/distribution/distribution/v3/configuration"
+	"github.com/distribution/distribution/v3/internal/dcontext"
+	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
+	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
 )
 
 // Tests to ensure nextProtos returns the correct protocols when:
@@ -100,7 +103,7 @@ func TestGracefulShutdown(t *testing.T) {
 	fmt.Fprintf(conn, "GET /v2/ ")
 
 	// send stop signal
-	quit <- os.Interrupt
+	registry.quit <- os.Interrupt
 	time.Sleep(100 * time.Millisecond)
 
 	// try connecting again. it shouldn't
@@ -115,10 +118,11 @@ func TestGracefulShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	if resp.Status != "200 OK" {
 		t.Error("response status is not 200 OK: ", resp.Status)
 	}
-	if body, err := ioutil.ReadAll(resp.Body); err != nil || string(body) != "{}" {
+	if body, err := io.ReadAll(resp.Body); err != nil || string(body) != "{}" {
 		t.Error("Body is not {}; ", string(body))
 	}
 }
@@ -132,7 +136,10 @@ func TestGetCipherSuite(t *testing.T) {
 		)
 	}
 
-	resp, err = getCipherSuites([]string{"TLS_RSA_WITH_AES_128_CBC_SHA", "TLS_AES_128_GCM_SHA256"})
+	resp, err = getCipherSuites([]string{
+		"TLS_RSA_WITH_AES_128_CBC_SHA",
+		"TLS_AES_128_GCM_SHA256",
+	})
 	if err != nil || len(resp) != 2 ||
 		resp[0] != tls.TLS_RSA_WITH_AES_128_CBC_SHA || resp[1] != tls.TLS_AES_128_GCM_SHA256 {
 		t.Errorf("expected cipher suites %q, got %q",
@@ -144,6 +151,22 @@ func TestGetCipherSuite(t *testing.T) {
 	_, err = getCipherSuites([]string{"TLS_RSA_WITH_AES_128_CBC_SHA", "bad_input"})
 	if err == nil {
 		t.Error("did not return expected error about unknown cipher suite")
+	}
+
+	insecureCipherSuites := []string{
+		"TLS_RSA_WITH_RC4_128_SHA",
+		"TLS_RSA_WITH_AES_128_CBC_SHA256",
+		"TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
+		"TLS_ECDHE_RSA_WITH_RC4_128_SHA",
+		"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+		"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+	}
+
+	for _, suite := range insecureCipherSuites {
+		_, err = getCipherSuites([]string{suite})
+		if err == nil {
+			t.Errorf("Unexpected insecure cipher suite: %s", suite)
+		}
 	}
 }
 
@@ -196,7 +219,9 @@ func buildRegistryTLSConfig(name, keyType string, cipherSuites []string) (*regis
 		return nil, fmt.Errorf("failed to create certificate: %v", err)
 	}
 	if _, err := os.Stat(os.TempDir()); os.IsNotExist(err) {
-		os.Mkdir(os.TempDir(), 1777)
+		if err := os.Mkdir(os.TempDir(), 1777); err != nil {
+			return nil, fmt.Errorf("failed to create temp dir: %v", err)
+		}
 	}
 
 	certPath := path.Join(os.TempDir(), name+".pem")
@@ -212,7 +237,7 @@ func buildRegistryTLSConfig(name, keyType string, cipherSuites []string) (*regis
 	}
 
 	keyPath := path.Join(os.TempDir(), name+".key")
-	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s for writing: %v", keyPath, err)
 	}
@@ -291,15 +316,16 @@ func TestRegistrySupportedCipherSuite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer resp.Body.Close()
 	if resp.Status != "200 OK" {
 		t.Error("response status is not 200 OK: ", resp.Status)
 	}
-	if body, err := ioutil.ReadAll(resp.Body); err != nil || string(body) != "{}" {
+	if body, err := io.ReadAll(resp.Body); err != nil || string(body) != "{}" {
 		t.Error("Body is not {}; ", string(body))
 	}
 
 	// send stop signal
-	quit <- os.Interrupt
+	registry.quit <- os.Interrupt
 	time.Sleep(100 * time.Millisecond)
 }
 
@@ -343,6 +369,62 @@ func TestRegistryUnsupportedCipherSuite(t *testing.T) {
 	}
 
 	// send stop signal
-	quit <- os.Interrupt
+	registry.quit <- os.Interrupt
 	time.Sleep(100 * time.Millisecond)
+}
+
+func TestConfigureLogging(t *testing.T) {
+	yamlConfig := `---
+log:
+  level: warn
+  fields:
+    foo: bar
+    baz: xyzzy
+`
+
+	var config configuration.Configuration
+	err := yaml.Unmarshal([]byte(yamlConfig), &config)
+	if err != nil {
+		t.Fatal("failed to parse config: ", err)
+	}
+
+	ctx, err := configureLogging(context.Background(), &config)
+	if err != nil {
+		t.Fatal("failed to configure logging: ", err)
+	}
+
+	// Check that the log level was set to Warn.
+	if logrus.IsLevelEnabled(logrus.InfoLevel) {
+		t.Error("expected Info to be disabled, is enabled")
+	}
+
+	// Check that the returned context's logger includes the right fields.
+	logger := dcontext.GetLogger(ctx)
+	entry, ok := logger.(*logrus.Entry)
+	if !ok {
+		t.Fatalf("expected logger to be a *logrus.Entry, is: %T", entry)
+	}
+	val, ok := entry.Data["foo"].(string)
+	if !ok || val != "bar" {
+		t.Error("field foo not configured correctly; expected 'bar' got: ", val)
+	}
+	val, ok = entry.Data["baz"].(string)
+	if !ok || val != "xyzzy" {
+		t.Error("field baz not configured correctly; expected 'xyzzy' got: ", val)
+	}
+
+	// Get a logger for a new, empty context and make sure it also has the right fields.
+	logger = dcontext.GetLogger(context.Background())
+	entry, ok = logger.(*logrus.Entry)
+	if !ok {
+		t.Fatalf("expected logger to be a *logrus.Entry, is: %T", entry)
+	}
+	val, ok = entry.Data["foo"].(string)
+	if !ok || val != "bar" {
+		t.Error("field foo not configured correctly; expected 'bar' got: ", val)
+	}
+	val, ok = entry.Data["baz"].(string)
+	if !ok || val != "xyzzy" {
+		t.Error("field baz not configured correctly; expected 'xyzzy' got: ", val)
+	}
 }

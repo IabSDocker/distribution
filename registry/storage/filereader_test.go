@@ -7,13 +7,13 @@ import (
 	mrand "math/rand"
 	"testing"
 
-	"github.com/docker/distribution/context"
-	"github.com/docker/distribution/registry/storage/driver/inmemory"
+	"github.com/distribution/distribution/v3/internal/dcontext"
+	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 	"github.com/opencontainers/go-digest"
 )
 
 func TestSimpleRead(t *testing.T) {
-	ctx := context.Background()
+	ctx := dcontext.Background()
 	content := make([]byte, 1<<20)
 	n, err := crand.Read(content)
 	if err != nil {
@@ -42,7 +42,9 @@ func TestSimpleRead(t *testing.T) {
 	}
 
 	verifier := dgst.Verifier()
-	io.Copy(verifier, fr)
+	if _, err := io.Copy(verifier, fr); err != nil {
+		t.Fatalf("failed writing verification data: %v", err)
+	}
 
 	if !verifier.Verified() {
 		t.Fatalf("unable to verify read data")
@@ -55,14 +57,13 @@ func TestFileReaderSeek(t *testing.T) {
 	repititions := 1024
 	path := "/patterned"
 	content := bytes.Repeat([]byte(pattern), repititions)
-	ctx := context.Background()
+	ctx := dcontext.Background()
 
 	if err := driver.PutContent(ctx, path, content); err != nil {
 		t.Fatalf("error putting patterned content: %v", err)
 	}
 
 	fr, err := newFileReader(ctx, driver, path, int64(len(content)))
-
 	if err != nil {
 		t.Fatalf("unexpected error creating file reader: %v", err)
 	}
@@ -157,7 +158,7 @@ func TestFileReaderSeek(t *testing.T) {
 // read method, with an io.EOF error.
 func TestFileReaderNonExistentFile(t *testing.T) {
 	driver := inmemory.New()
-	fr, err := newFileReader(context.Background(), driver, "/doesnotexist", 10)
+	fr, err := newFileReader(dcontext.Background(), driver, "/doesnotexist", 10)
 	if err != nil {
 		t.Fatalf("unexpected error initializing reader: %v", err)
 	}

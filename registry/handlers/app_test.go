@@ -8,15 +8,15 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/docker/distribution/configuration"
-	"github.com/docker/distribution/context"
-	"github.com/docker/distribution/registry/api/errcode"
-	v2 "github.com/docker/distribution/registry/api/v2"
-	"github.com/docker/distribution/registry/auth"
-	_ "github.com/docker/distribution/registry/auth/silly"
-	"github.com/docker/distribution/registry/storage"
-	memorycache "github.com/docker/distribution/registry/storage/cache/memory"
-	"github.com/docker/distribution/registry/storage/driver/testdriver"
+	"github.com/distribution/distribution/v3/configuration"
+	"github.com/distribution/distribution/v3/internal/dcontext"
+	"github.com/distribution/distribution/v3/registry/api/errcode"
+	v2 "github.com/distribution/distribution/v3/registry/api/v2"
+	"github.com/distribution/distribution/v3/registry/auth"
+	_ "github.com/distribution/distribution/v3/registry/auth/silly"
+	"github.com/distribution/distribution/v3/registry/storage"
+	memorycache "github.com/distribution/distribution/v3/registry/storage/cache/memory"
+	"github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
 )
 
 // TestAppDispatcher builds an application with a test dispatcher and ensures
@@ -24,9 +24,9 @@ import (
 // This only tests the dispatch mechanism. The underlying dispatchers must be
 // tested individually.
 func TestAppDispatcher(t *testing.T) {
-	driver := testdriver.New()
-	ctx := context.Background()
-	registry, err := storage.NewRegistry(ctx, driver, storage.BlobDescriptorCacheProvider(memorycache.NewInMemoryBlobDescriptorCacheProvider()), storage.EnableDelete, storage.EnableRedirect)
+	driver := inmemory.New()
+	ctx := dcontext.Background()
+	registry, err := storage.NewRegistry(ctx, driver, storage.BlobDescriptorCacheProvider(memorycache.NewInMemoryBlobDescriptorCacheProvider(0)), storage.EnableDelete, storage.EnableRedirect)
 	if err != nil {
 		t.Fatalf("error creating registry: %v", err)
 	}
@@ -120,16 +120,15 @@ func TestAppDispatcher(t *testing.T) {
 		app.register(testcase.endpoint, varCheckingDispatcher(unflatten(testcase.vars)))
 		route := router.GetRoute(testcase.endpoint).Host(serverURL.Host)
 		u, err := route.URL(testcase.vars...)
-
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		resp, err := http.Get(u.String())
-
 		if err != nil {
 			t.Fatal(err)
 		}
+		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("unexpected status code: %v != %v", resp.StatusCode, http.StatusOK)
@@ -140,10 +139,10 @@ func TestAppDispatcher(t *testing.T) {
 // TestNewApp covers the creation of an application via NewApp with a
 // configuration.
 func TestNewApp(t *testing.T) {
-	ctx := context.Background()
+	ctx := dcontext.Background()
 	config := configuration.Configuration{
 		Storage: configuration.Storage{
-			"testdriver": nil,
+			"inmemory": nil,
 			"maintenance": configuration.Parameters{"uploadpurging": map[interface{}]interface{}{
 				"enabled": false,
 			}},
@@ -188,8 +187,8 @@ func TestNewApp(t *testing.T) {
 		t.Fatalf("unexpected status code during request: %v", err)
 	}
 
-	if req.Header.Get("Content-Type") != "application/json; charset=utf-8" {
-		t.Fatalf("unexpected content-type: %v != %v", req.Header.Get("Content-Type"), "application/json; charset=utf-8")
+	if req.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("unexpected content-type: %v != %v", req.Header.Get("Content-Type"), "application/json")
 	}
 
 	expectedAuthHeader := "Bearer realm=\"realm-test\",service=\"service-test\""
@@ -235,45 +234,44 @@ func TestAppendAccessRecords(t *testing.T) {
 	}
 
 	records := []auth.Access{}
-	result := appendAccessRecords(records, "GET", repo)
+	result := appendAccessRecords(records, http.MethodGet, repo)
 	expectedResult := []auth.Access{expectedPullRecord}
 	if ok := reflect.DeepEqual(result, expectedResult); !ok {
 		t.Fatalf("Actual access record differs from expected")
 	}
 
 	records = []auth.Access{}
-	result = appendAccessRecords(records, "HEAD", repo)
+	result = appendAccessRecords(records, http.MethodHead, repo)
 	expectedResult = []auth.Access{expectedPullRecord}
 	if ok := reflect.DeepEqual(result, expectedResult); !ok {
 		t.Fatalf("Actual access record differs from expected")
 	}
 
 	records = []auth.Access{}
-	result = appendAccessRecords(records, "POST", repo)
+	result = appendAccessRecords(records, http.MethodPost, repo)
 	expectedResult = []auth.Access{expectedPullRecord, expectedPushRecord}
 	if ok := reflect.DeepEqual(result, expectedResult); !ok {
 		t.Fatalf("Actual access record differs from expected")
 	}
 
 	records = []auth.Access{}
-	result = appendAccessRecords(records, "PUT", repo)
+	result = appendAccessRecords(records, http.MethodPut, repo)
 	expectedResult = []auth.Access{expectedPullRecord, expectedPushRecord}
 	if ok := reflect.DeepEqual(result, expectedResult); !ok {
 		t.Fatalf("Actual access record differs from expected")
 	}
 
 	records = []auth.Access{}
-	result = appendAccessRecords(records, "PATCH", repo)
+	result = appendAccessRecords(records, http.MethodPatch, repo)
 	expectedResult = []auth.Access{expectedPullRecord, expectedPushRecord}
 	if ok := reflect.DeepEqual(result, expectedResult); !ok {
 		t.Fatalf("Actual access record differs from expected")
 	}
 
 	records = []auth.Access{}
-	result = appendAccessRecords(records, "DELETE", repo)
+	result = appendAccessRecords(records, http.MethodDelete, repo)
 	expectedResult = []auth.Access{expectedDeleteRecord}
 	if ok := reflect.DeepEqual(result, expectedResult); !ok {
 		t.Fatalf("Actual access record differs from expected")
 	}
-
 }

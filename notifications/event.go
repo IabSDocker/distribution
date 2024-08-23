@@ -4,7 +4,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/docker/distribution"
+	"github.com/distribution/distribution/v3"
+	events "github.com/docker/go-events"
 )
 
 // EventAction constants used in action field of Event.
@@ -19,7 +20,7 @@ const (
 	// EventsMediaType is the mediatype for the json event envelope. If the
 	// Event, ActorRecord, SourceRecord or Envelope structs change, the version
 	// number should be incremented.
-	EventsMediaType = "application/vnd.docker.distribution.events.v1+json"
+	EventsMediaType = "application/vnd.docker.distribution.events.v2+json"
 	// LayerMediaType is the media type for image rootfs diffs (aka "layers")
 	// used by Docker. We don't expect this to change for quite a while.
 	layerMediaType = "application/vnd.docker.container.image.rootfs.diff+x-gtar"
@@ -30,7 +31,7 @@ const (
 type Envelope struct {
 	// Events make up the contents of the envelope. Events present in a single
 	// envelope are not necessarily related.
-	Events []Event `json:"events,omitempty"`
+	Events []events.Event `json:"events,omitempty"`
 }
 
 // TODO(stevvooe): The event type should be separate from the json format. It
@@ -142,22 +143,7 @@ type SourceRecord struct {
 	InstanceID string `json:"instanceID,omitempty"`
 }
 
-var (
-	// ErrSinkClosed is returned if a write is issued to a sink that has been
-	// closed. If encountered, the error should be considered terminal and
-	// retries will not be successful.
-	ErrSinkClosed = fmt.Errorf("sink: closed")
-)
-
-// Sink accepts and sends events.
-type Sink interface {
-	// Write writes one or more events to the sink. If no error is returned,
-	// the caller will assume that all events have been committed and will not
-	// try to send them again. If an error is received, the caller may retry
-	// sending the event. The caller should cede the slice of memory to the
-	// sink and not modify it after calling this method.
-	Write(events ...Event) error
-
-	// Close the sink, possibly waiting for pending events to flush.
-	Close() error
-}
+// ErrSinkClosed is returned if a write is issued to a sink that has been
+// closed. If encountered, the error should be considered terminal and
+// retries will not be successful.
+var ErrSinkClosed = fmt.Errorf("sink: closed")

@@ -8,10 +8,8 @@ import (
 	"net/url"
 	"strconv"
 
-	"github.com/docker/distribution/registry/api/errcode"
-	v2 "github.com/docker/distribution/registry/api/v2"
-	"github.com/docker/distribution/registry/storage/driver"
-
+	"github.com/distribution/distribution/v3/registry/api/errcode"
+	"github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/gorilla/handlers"
 )
 
@@ -23,7 +21,7 @@ func catalogDispatcher(ctx *Context, r *http.Request) http.Handler {
 	}
 
 	return handlers.MethodHandler{
-		"GET": http.HandlerFunc(catalogHandler.GetCatalog),
+		http.MethodGet: http.HandlerFunc(catalogHandler.GetCatalog),
 	}
 }
 
@@ -36,7 +34,7 @@ type catalogAPIResponse struct {
 }
 
 func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
-	var moreEntries = true
+	moreEntries := true
 
 	q := r.URL.Query()
 	lastEntry := q.Get("last")
@@ -44,17 +42,20 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 	entries := defaultReturnedEntries
 	maximumConfiguredEntries := ch.App.Config.Catalog.MaxEntries
 
-	// parse n, if n unparseable, or negative assign it to defaultReturnedEntries
+	// parse n, if n is negative abort with an error
 	if n := q.Get("n"); n != "" {
 		parsedMax, err := strconv.Atoi(n)
-		if err == nil {
-			if parsedMax > maximumConfiguredEntries {
-				ch.Errors = append(ch.Errors, v2.ErrorCodePaginationNumberInvalid.WithDetail(map[string]int{"n": parsedMax}))
-				return
-			} else if parsedMax >= 0 {
-				entries = parsedMax
-			}
+		if err != nil || parsedMax < 0 {
+			ch.Errors = append(ch.Errors, errcode.ErrorCodePaginationNumberInvalid.WithDetail(map[string]string{"n": n}))
+			return
 		}
+
+		// if a client requests more than it's allowed to receive
+		if parsedMax > maximumConfiguredEntries {
+			ch.Errors = append(ch.Errors, errcode.ErrorCodePaginationNumberInvalid.WithDetail(map[string]int{"n": parsedMax}))
+			return
+		}
+		entries = parsedMax
 	}
 
 	// then enforce entries to be between 0 & maximumConfiguredEntries
@@ -83,7 +84,7 @@ func (ch *catalogHandler) GetCatalog(w http.ResponseWriter, r *http.Request) {
 		filled = returnedRepositories
 	}
 
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", "application/json")
 
 	// Add a link header if there are more entries to retrieve
 	if moreEntries {

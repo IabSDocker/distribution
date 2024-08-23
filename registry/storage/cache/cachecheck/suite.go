@@ -5,8 +5,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/docker/distribution"
-	"github.com/docker/distribution/registry/storage/cache"
+	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/registry/storage/cache"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -39,19 +39,25 @@ func checkBlobDescriptorCacheEmptyRepository(ctx context.Context, t *testing.T, 
 	if err := cache.SetDescriptor(ctx, "", distribution.Descriptor{
 		Digest:    "sha384:abc",
 		Size:      10,
-		MediaType: "application/octet-stream"}); err != digest.ErrDigestInvalidFormat {
+		MediaType: "application/octet-stream",
+	}); err != digest.ErrDigestInvalidFormat {
 		t.Fatalf("expected error with invalid digest: %v", err)
 	}
 
 	if err := cache.SetDescriptor(ctx, "sha384:abc111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111", distribution.Descriptor{
 		Digest:    "",
 		Size:      10,
-		MediaType: "application/octet-stream"}); err == nil {
+		MediaType: "application/octet-stream",
+	}); err == nil {
 		t.Fatalf("expected error setting value on invalid descriptor")
 	}
 
 	if _, err := cache.Stat(ctx, ""); err != digest.ErrDigestInvalidFormat {
 		t.Fatalf("expected error checking for cache item with empty digest: %v", err)
+	}
+
+	if _, err := cache.Stat(ctx, "sha384:cba111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"); err != distribution.ErrBlobUnknown {
+		t.Fatalf("expected unknown blob error with uncached repo: %v", err)
 	}
 
 	if _, err := cache.Stat(ctx, "sha384:abc111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111"); err != distribution.ErrBlobUnknown {
@@ -64,7 +70,8 @@ func checkBlobDescriptorCacheSetAndRead(ctx context.Context, t *testing.T, provi
 	expected := distribution.Descriptor{
 		Digest:    "sha256:abc1111111111111111111111111111111111111111111111111111111111111",
 		Size:      10,
-		MediaType: "application/octet-stream"}
+		MediaType: "application/octet-stream",
+	}
 
 	cache, err := provider.RepositoryScoped("foo/bar")
 	if err != nil {
@@ -148,7 +155,8 @@ func checkBlobDescriptorCacheClear(ctx context.Context, t *testing.T, provider c
 	expected := distribution.Descriptor{
 		Digest:    "sha256:def1111111111111111111111111111111111111111111111111111111111111",
 		Size:      10,
-		MediaType: "application/octet-stream"}
+		MediaType: "application/octet-stream",
+	}
 
 	cache, err := provider.RepositoryScoped("foo/bar")
 	if err != nil {

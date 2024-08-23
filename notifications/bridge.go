@@ -4,10 +4,11 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/distribution/distribution/v3"
+	"github.com/distribution/distribution/v3/internal/requestutil"
 	"github.com/distribution/reference"
-	"github.com/docker/distribution"
-	"github.com/docker/distribution/context"
-	"github.com/docker/distribution/uuid"
+	events "github.com/docker/go-events"
+	"github.com/google/uuid"
 	"github.com/opencontainers/go-digest"
 )
 
@@ -17,7 +18,7 @@ type bridge struct {
 	actor             ActorRecord
 	source            SourceRecord
 	request           RequestRecord
-	sink              Sink
+	sink              events.Sink
 }
 
 var _ Listener = &bridge{}
@@ -32,7 +33,7 @@ type URLBuilder interface {
 // using the actor and source. Any urls populated in the events created by
 // this bridge will be created using the URLBuilder.
 // TODO(stevvooe): Update this to simply take a context.Context object.
-func NewBridge(ub URLBuilder, source SourceRecord, actor ActorRecord, request RequestRecord, sink Sink, includeReferences bool) Listener {
+func NewBridge(ub URLBuilder, source SourceRecord, actor ActorRecord, request RequestRecord, sink events.Sink, includeReferences bool) Listener {
 	return &bridge{
 		ub:                ub,
 		includeReferences: includeReferences,
@@ -48,7 +49,7 @@ func NewBridge(ub URLBuilder, source SourceRecord, actor ActorRecord, request Re
 func NewRequestRecord(id string, r *http.Request) RequestRecord {
 	return RequestRecord{
 		ID:        id,
-		Addr:      context.RemoteAddr(r),
+		Addr:      requestutil.RemoteAddr(r),
 		Host:      r.Host,
 		Method:    r.Method,
 		UserAgent: r.UserAgent(),
@@ -149,9 +150,9 @@ func (b *bridge) createManifestEvent(action string, repo reference.Named, sm dis
 	}
 
 	event.Target.MediaType = mt
-	event.Target.Length = desc.Size
-	event.Target.Size = desc.Size
 	event.Target.Digest = desc.Digest
+	event.Target.Size = desc.Size
+	event.Target.Length = desc.Size
 	if b.includeReferences {
 		event.Target.References = append(event.Target.References, manifest.References()...)
 	}
@@ -218,7 +219,7 @@ func (b *bridge) createEvent(action string) *Event {
 // createEvent returns a new event, timestamped, with the specified action.
 func createEvent(action string) *Event {
 	return &Event{
-		ID:        uuid.Generate().String(),
+		ID:        uuid.NewString(),
 		Timestamp: time.Now(),
 		Action:    action,
 	}

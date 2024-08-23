@@ -20,14 +20,13 @@ import (
 	"regexp"
 	"text/template"
 
-	"github.com/docker/distribution/registry/api/errcode"
-	v2 "github.com/docker/distribution/registry/api/v2"
+	"github.com/distribution/distribution/v3/registry/api/errcode"
+	v2 "github.com/distribution/distribution/v3/registry/api/v2"
 )
 
 var spaceRegex = regexp.MustCompile(`\n\s*`)
 
 func main() {
-
 	if len(os.Args) != 2 {
 		log.Fatalln("please specify a template to execute.")
 	}
@@ -127,5 +126,4 @@ end:
 	}
 
 	return output
-
 }

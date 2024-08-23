@@ -3,10 +3,14 @@ package storage
 import (
 	"context"
 	"path"
+	"sort"
+	"sync"
 
-	"github.com/docker/distribution"
-	storagedriver "github.com/docker/distribution/registry/storage/driver"
 	"github.com/opencontainers/go-digest"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/distribution/distribution/v3"
+	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 )
 
 var _ distribution.TagService = &tagStore{}
@@ -17,47 +21,50 @@ var _ distribution.TagService = &tagStore{}
 // which only makes use of the Digest field of the returned distribution.Descriptor
 // but does not enable full roundtripping of Descriptor objects
 type tagStore struct {
-	repository *repository
-	blobStore  *blobStore
+	repository       *repository
+	blobStore        *blobStore
+	concurrencyLimit int
 }
 
 // All returns all tags
 func (ts *tagStore) All(ctx context.Context) ([]string, error) {
-	var tags []string
-
-	pathSpec, err := pathFor(manifestTagPathSpec{
+	pathSpec, err := pathFor(manifestTagsPathSpec{
 		name: ts.repository.Named().Name(),
 	})
 	if err != nil {
-		return tags, err
+		return nil, err
 	}
 
 	entries, err := ts.blobStore.driver.List(ctx, pathSpec)
 	if err != nil {
 		switch err := err.(type) {
 		case storagedriver.PathNotFoundError:
-			return tags, distribution.ErrRepositoryUnknown{Name: ts.repository.Named().Name()}
+			return nil, distribution.ErrRepositoryUnknown{Name: ts.repository.Named().Name()}
 		default:
-			return tags, err
+			return nil, err
 		}
 	}
 
+	tags := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		_, filename := path.Split(entry)
 		tags = append(tags, filename)
 	}
 
+	// there is no guarantee for the order,
+	// therefore sort before return.
+	sort.Strings(tags)
+
 	return tags, nil
 }
 
-// Tag tags the digest with the given tag, updating the the store to point at
+// Tag tags the digest with the given tag, updating the store to point at
 // the current tag. The digest must point to a manifest.
 func (ts *tagStore) Tag(ctx context.Context, tag string, desc distribution.Descriptor) error {
 	currentPath, err := pathFor(manifestTagCurrentPathSpec{
 		name: ts.repository.Named().Name(),
 		tag:  tag,
 	})
-
 	if err != nil {
 		return err
 	}
@@ -79,7 +86,6 @@ func (ts *tagStore) Get(ctx context.Context, tag string) (distribution.Descripto
 		name: ts.repository.Named().Name(),
 		tag:  tag,
 	})
-
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
@@ -107,16 +113,7 @@ func (ts *tagStore) Untag(ctx context.Context, tag string) error {
 		return err
 	}
 
-	if err := ts.blobStore.driver.Delete(ctx, tagPath); err != nil {
-		switch err.(type) {
-		case storagedriver.PathNotFoundError:
-			return nil // Untag is idempotent, we don't care if it didn't exist
-		default:
-			return err
-		}
-	}
-
-	return nil
+	return ts.blobStore.driver.Delete(ctx, tagPath)
 }
 
 // linkedBlobStore returns the linkedBlobStore for the named tag, allowing one
@@ -128,14 +125,13 @@ func (ts *tagStore) linkedBlobStore(ctx context.Context, tag string) *linkedBlob
 		blobStore:  ts.blobStore,
 		repository: ts.repository,
 		ctx:        ctx,
-		linkPathFns: []linkPathFunc{func(name string, dgst digest.Digest) (string, error) {
+		linkPath: func(name string, dgst digest.Digest) (string, error) {
 			return pathFor(manifestTagIndexEntryLinkPathSpec{
 				name:     name,
 				tag:      tag,
 				revision: dgst,
 			})
-
-		}},
+		},
 	}
 }
 
@@ -153,27 +149,83 @@ func (ts *tagStore) Lookup(ctx context.Context, desc distribution.Descriptor) ([
 		return nil, err
 	}
 
-	var tags []string
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(ts.concurrencyLimit)
+
+	var (
+		tags []string
+		mu   sync.Mutex
+	)
 	for _, tag := range allTags {
-		tagLinkPathSpec := manifestTagCurrentPathSpec{
-			name: ts.repository.Named().Name(),
-			tag:  tag,
+		if ctx.Err() != nil {
+			break
 		}
+		tag := tag
 
-		tagLinkPath, _ := pathFor(tagLinkPathSpec)
-		tagDigest, err := ts.blobStore.readlink(ctx, tagLinkPath)
-		if err != nil {
-			switch err.(type) {
-			case storagedriver.PathNotFoundError:
-				continue
+		g.Go(func() error {
+			tagLinkPathSpec := manifestTagCurrentPathSpec{
+				name: ts.repository.Named().Name(),
+				tag:  tag,
 			}
-			return nil, err
-		}
 
-		if tagDigest == desc.Digest {
-			tags = append(tags, tag)
-		}
+			tagLinkPath, _ := pathFor(tagLinkPathSpec)
+			tagDigest, err := ts.blobStore.readlink(ctx, tagLinkPath)
+			if err != nil {
+				switch err.(type) {
+				case storagedriver.PathNotFoundError:
+					return nil
+				}
+				return err
+			}
+
+			if tagDigest == desc.Digest {
+				mu.Lock()
+				tags = append(tags, tag)
+				mu.Unlock()
+			}
+
+			return nil
+		})
+	}
+
+	err = g.Wait()
+	if err != nil {
+		return nil, err
 	}
 
 	return tags, nil
+}
+
+func (ts *tagStore) ManifestDigests(ctx context.Context, tag string) ([]digest.Digest, error) {
+	tagLinkPath := func(name string, dgst digest.Digest) (string, error) {
+		return pathFor(manifestTagIndexEntryLinkPathSpec{
+			name:     name,
+			tag:      tag,
+			revision: dgst,
+		})
+	}
+	lbs := &linkedBlobStore{
+		blobStore: ts.blobStore,
+		blobAccessController: &linkedBlobStatter{
+			blobStore:  ts.blobStore,
+			repository: ts.repository,
+			linkPath:   manifestRevisionLinkPath,
+		},
+		repository: ts.repository,
+		ctx:        ctx,
+		linkPath:   tagLinkPath,
+		linkDirectoryPathSpec: manifestTagIndexPathSpec{
+			name: ts.repository.Named().Name(),
+			tag:  tag,
+		},
+	}
+	var dgsts []digest.Digest
+	err := lbs.Enumerate(ctx, func(dgst digest.Digest) error {
+		dgsts = append(dgsts, dgst)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return dgsts, nil
 }

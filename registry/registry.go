@@ -4,8 +4,8 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,45 +13,39 @@ import (
 	"syscall"
 	"time"
 
-	"rsc.io/letsencrypt"
-
-	logrus_bugsnag "github.com/Shopify/logrus-bugsnag"
-
 	logstash "github.com/bshuster-repo/logrus-logstash-hook"
-	"github.com/bugsnag/bugsnag-go"
-	"github.com/docker/distribution/configuration"
-	dcontext "github.com/docker/distribution/context"
-	"github.com/docker/distribution/health"
-	"github.com/docker/distribution/registry/handlers"
-	"github.com/docker/distribution/registry/listener"
-	"github.com/docker/distribution/uuid"
-	"github.com/docker/distribution/version"
 	"github.com/docker/go-metrics"
 	gorhandlers "github.com/gorilla/handlers"
-	log "github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/yvasiyarov/gorelic"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"golang.org/x/crypto/acme"
+	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
+	"github.com/distribution/distribution/v3/configuration"
+	"github.com/distribution/distribution/v3/health"
+	"github.com/distribution/distribution/v3/internal/dcontext"
+	"github.com/distribution/distribution/v3/registry/handlers"
+	"github.com/distribution/distribution/v3/registry/listener"
+	"github.com/distribution/distribution/v3/tracing"
+	"github.com/distribution/distribution/v3/version"
 )
 
 // a map of TLS cipher suite names to constants in https://golang.org/pkg/crypto/tls/#pkg-constants
 var cipherSuites = map[string]uint16{
 	// TLS 1.0 - 1.2 cipher suites
-	"TLS_RSA_WITH_RC4_128_SHA":                      tls.TLS_RSA_WITH_RC4_128_SHA,
 	"TLS_RSA_WITH_3DES_EDE_CBC_SHA":                 tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
 	"TLS_RSA_WITH_AES_128_CBC_SHA":                  tls.TLS_RSA_WITH_AES_128_CBC_SHA,
 	"TLS_RSA_WITH_AES_256_CBC_SHA":                  tls.TLS_RSA_WITH_AES_256_CBC_SHA,
-	"TLS_RSA_WITH_AES_128_CBC_SHA256":               tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
 	"TLS_RSA_WITH_AES_128_GCM_SHA256":               tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
 	"TLS_RSA_WITH_AES_256_GCM_SHA384":               tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
-	"TLS_ECDHE_ECDSA_WITH_RC4_128_SHA":              tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
 	"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA":          tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
 	"TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA":          tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-	"TLS_ECDHE_RSA_WITH_RC4_128_SHA":                tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
 	"TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA":           tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
 	"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA":            tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
 	"TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA":            tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-	"TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256":       tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-	"TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256":         tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
 	"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256":         tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 	"TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256":       tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 	"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384":         tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -77,18 +71,26 @@ var defaultCipherSuites = []uint16{
 	tls.TLS_AES_256_GCM_SHA384,
 }
 
-// maps tls version strings to constants
-var defaultTLSVersionStr = "tls1.2"
+const defaultTLSVersionStr = "tls1.2"
+
+// tlsVersions maps user-specified values to tls version constants.
 var tlsVersions = map[string]uint16{
-	// user specified values
-	"tls1.0": tls.VersionTLS10,
-	"tls1.1": tls.VersionTLS11,
 	"tls1.2": tls.VersionTLS12,
 	"tls1.3": tls.VersionTLS13,
 }
 
-// this channel gets notified when process receives signal. It is global to ease unit testing
-var quit = make(chan os.Signal, 1)
+// defaultLogFormatter is the default formatter to use for logs.
+const defaultLogFormatter = "text"
+
+// HandlerFunc defines an http middleware
+type HandlerFunc func(config *configuration.Configuration, handler http.Handler) http.Handler
+
+var handlerMiddlewares []HandlerFunc
+
+// RegisterHandler is used to register http middlewares to the registry service
+func RegisterHandler(handlerFunc HandlerFunc) {
+	handlerMiddlewares = append(handlerMiddlewares, handlerFunc)
+}
 
 // ServeCmd is a cobra command for running the registry.
 var ServeCmd = &cobra.Command{
@@ -96,52 +98,37 @@ var ServeCmd = &cobra.Command{
 	Short: "`serve` stores and distributes Docker images",
 	Long:  "`serve` stores and distributes Docker images.",
 	Run: func(cmd *cobra.Command, args []string) {
-
 		// setup context
-		ctx := dcontext.WithVersion(dcontext.Background(), version.Version)
+		ctx := dcontext.WithVersion(dcontext.Background(), version.Version())
 
 		config, err := resolveConfiguration(args)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "configuration error: %v\n", err)
+			// nolint:errcheck
 			cmd.Usage()
 			os.Exit(1)
 		}
-
-		if config.HTTP.Debug.Addr != "" {
-			go func(addr string) {
-				log.Infof("debug server listening %v", addr)
-				if err := http.ListenAndServe(addr, nil); err != nil {
-					log.Fatalf("error listening on debug interface: %v", err)
-				}
-			}(config.HTTP.Debug.Addr)
-		}
-
 		registry, err := NewRegistry(ctx, config)
 		if err != nil {
-			log.Fatalln(err)
+			logrus.Fatalln(err)
 		}
 
-		if config.HTTP.Debug.Prometheus.Enabled {
-			path := config.HTTP.Debug.Prometheus.Path
-			if path == "" {
-				path = "/metrics"
-			}
-			log.Info("providing prometheus metrics on ", path)
-			http.Handle(path, metrics.Handler())
-		}
+		configureDebugServer(config)
 
 		if err = registry.ListenAndServe(); err != nil {
-			log.Fatalln(err)
+			logrus.Fatalln(err)
 		}
 	},
 }
 
 // A Registry represents a complete instance of the registry.
+//
 // TODO(aaronl): It might make sense for Registry to become an interface.
 type Registry struct {
 	config *configuration.Configuration
 	app    *handlers.App
 	server *http.Server
+	quit   chan os.Signal
 }
 
 // NewRegistry creates a new registry from a context and configuration struct.
@@ -152,23 +139,30 @@ func NewRegistry(ctx context.Context, config *configuration.Configuration) (*Reg
 		return nil, fmt.Errorf("error configuring logger: %v", err)
 	}
 
-	configureBugsnag(config)
-
-	// inject a logger into the uuid library. warns us if there is a problem
-	// with uuid generation under low entropy.
-	uuid.Loggerf = dcontext.GetLogger(ctx).Warnf
-
 	app := handlers.NewApp(ctx, config)
 	// TODO(aaronl): The global scope of the health checks means NewRegistry
 	// can only be called once per process.
 	app.RegisterHealthChecks()
-	handler := configureReporting(app)
+	var handler http.Handler = app
 	handler = alive("/", handler)
 	handler = health.Handler(handler)
 	handler = panicHandler(handler)
 	if !config.Log.AccessLog.Disabled {
 		handler = gorhandlers.CombinedLoggingHandler(os.Stdout, handler)
 	}
+
+	for _, applyHandlerMiddleware := range handlerMiddlewares {
+		handler = applyHandlerMiddleware(config, handler)
+	}
+
+	err = tracing.InitOpenTelemetry(app.Context)
+	if err != nil {
+		return nil, fmt.Errorf("error during open telemetry initialization: %v", err)
+	}
+	if config.HTTP.H2C.Enabled {
+		handler = h2c.NewHandler(handler, &http2.Server{})
+	}
+	handler = otelHandler(handler)
 
 	server := &http.Server{
 		Handler: handler,
@@ -178,7 +172,15 @@ func NewRegistry(ctx context.Context, config *configuration.Configuration) (*Reg
 		app:    app,
 		config: config,
 		server: server,
+		quit:   make(chan os.Signal, 1),
 	}, nil
+}
+
+// otelHandler returns an http.Handler that wraps the provided `next` handler with OpenTelemetry instrumentation.
+// This instrumentation tracks each HTTP request, creating spans with names derived from the request method and URL path.
+func otelHandler(next http.Handler) http.Handler {
+	return otelhttp.NewHandler(next, "",
+		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return r.Method + " " + r.URL.Path }))
 }
 
 // takes a list of cipher suites and converts it to a list of respective tls constants
@@ -210,6 +212,14 @@ func getCipherSuiteNames(ids []uint16) []string {
 	return names
 }
 
+// set ACME-server/DirectoryURL, if provided
+func setDirectoryURL(directoryurl string) *acme.Client {
+	if len(directoryurl) > 0 {
+		return &acme.Client{DirectoryURL: directoryurl}
+	}
+	return nil
+}
+
 // ListenAndServe runs the registry's HTTP server.
 func (registry *Registry) ListenAndServe() error {
 	config := registry.config
@@ -229,11 +239,18 @@ func (registry *Registry) ListenAndServe() error {
 		}
 		dcontext.GetLogger(registry.app).Infof("restricting TLS version to %s or higher", config.HTTP.TLS.MinimumTLS)
 
-		tlsCipherSuites, err := getCipherSuites(config.HTTP.TLS.CipherSuites)
-		if err != nil {
-			return err
+		var tlsCipherSuites []uint16
+		// configuring cipher suites are no longer supported after the tls1.3.
+		// (https://go.dev/blog/tls-cipher-suites)
+		if tlsMinVersion > tls.VersionTLS12 {
+			dcontext.GetLogger(registry.app).Warnf("restricting TLS cipher suites to empty. Because configuring cipher suites is no longer supported in %s", config.HTTP.TLS.MinimumTLS)
+		} else {
+			tlsCipherSuites, err = getCipherSuites(config.HTTP.TLS.CipherSuites)
+			if err != nil {
+				return err
+			}
+			dcontext.GetLogger(registry.app).Infof("restricting TLS cipher suites to: %s", strings.Join(getCipherSuiteNames(tlsCipherSuites), ","))
 		}
-		dcontext.GetLogger(registry.app).Infof("restricting TLS cipher suites to: %s", strings.Join(getCipherSuiteNames(tlsCipherSuites), ","))
 
 		tlsConf := &tls.Config{
 			ClientAuth:   tls.NoClientCert,
@@ -246,19 +263,15 @@ func (registry *Registry) ListenAndServe() error {
 			if config.HTTP.TLS.Certificate != "" {
 				return fmt.Errorf("cannot specify both certificate and Let's Encrypt")
 			}
-			var m letsencrypt.Manager
-			if err := m.CacheFile(config.HTTP.TLS.LetsEncrypt.CacheFile); err != nil {
-				return err
-			}
-			if !m.Registered() {
-				if err := m.Register(config.HTTP.TLS.LetsEncrypt.Email, nil); err != nil {
-					return err
-				}
-			}
-			if len(config.HTTP.TLS.LetsEncrypt.Hosts) > 0 {
-				m.SetHosts(config.HTTP.TLS.LetsEncrypt.Hosts)
+			m := &autocert.Manager{
+				HostPolicy: autocert.HostWhitelist(config.HTTP.TLS.LetsEncrypt.Hosts...),
+				Cache:      autocert.DirCache(config.HTTP.TLS.LetsEncrypt.CacheFile),
+				Email:      config.HTTP.TLS.LetsEncrypt.Email,
+				Prompt:     autocert.AcceptTOS,
+				Client:     setDirectoryURL(config.HTTP.TLS.LetsEncrypt.DirectoryURL),
 			}
 			tlsConf.GetCertificate = m.GetCertificate
+			tlsConf.NextProtos = append(tlsConf.NextProtos, acme.ALPNProto)
 		} else {
 			tlsConf.Certificates = make([]tls.Certificate, 1)
 			tlsConf.Certificates[0], err = tls.LoadX509KeyPair(config.HTTP.TLS.Certificate, config.HTTP.TLS.Key)
@@ -271,7 +284,7 @@ func (registry *Registry) ListenAndServe() error {
 			pool := x509.NewCertPool()
 
 			for _, ca := range config.HTTP.TLS.ClientCAs {
-				caPem, err := ioutil.ReadFile(ca)
+				caPem, err := os.ReadFile(ca)
 				if err != nil {
 					return err
 				}
@@ -300,7 +313,7 @@ func (registry *Registry) ListenAndServe() error {
 	}
 
 	// setup channel to get notified on SIGTERM signal
-	signal.Notify(quit, syscall.SIGTERM)
+	signal.Notify(registry.quit, os.Interrupt, syscall.SIGTERM)
 	serveErr := make(chan error)
 
 	// Start serving in goroutine and listen for stop signal in main thread
@@ -311,72 +324,77 @@ func (registry *Registry) ListenAndServe() error {
 	select {
 	case err := <-serveErr:
 		return err
-	case <-quit:
+	case <-registry.quit:
 		dcontext.GetLogger(registry.app).Info("stopping server gracefully. Draining connections for ", config.HTTP.DrainTimeout)
 		// shutdown the server with a grace period of configured timeout
 		c, cancel := context.WithTimeout(context.Background(), config.HTTP.DrainTimeout)
 		defer cancel()
-		return registry.server.Shutdown(c)
+		return registry.Shutdown(c)
 	}
 }
 
-func configureReporting(app *handlers.App) http.Handler {
-	var handler http.Handler = app
-
-	if app.Config.Reporting.Bugsnag.APIKey != "" {
-		handler = bugsnag.Handler(handler)
+// Shutdown gracefully shuts down the registry's HTTP server and application object.
+func (registry *Registry) Shutdown(ctx context.Context) error {
+	err := registry.server.Shutdown(ctx)
+	if appErr := registry.app.Shutdown(); appErr != nil {
+		err = errors.Join(err, appErr)
 	}
+	return err
+}
 
-	if app.Config.Reporting.NewRelic.LicenseKey != "" {
-		agent := gorelic.NewAgent()
-		agent.NewrelicLicense = app.Config.Reporting.NewRelic.LicenseKey
-		if app.Config.Reporting.NewRelic.Name != "" {
-			agent.NewrelicName = app.Config.Reporting.NewRelic.Name
+func configureDebugServer(config *configuration.Configuration) {
+	if config.HTTP.Debug.Addr != "" {
+		go func(addr string) {
+			logrus.Infof("debug server listening %v", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil {
+				logrus.Fatalf("error listening on debug interface: %v", err)
+			}
+		}(config.HTTP.Debug.Addr)
+		configurePrometheus(config)
+	}
+}
+
+func configurePrometheus(config *configuration.Configuration) {
+	if config.HTTP.Debug.Prometheus.Enabled {
+		path := config.HTTP.Debug.Prometheus.Path
+		if path == "" {
+			path = "/metrics"
 		}
-		agent.CollectHTTPStat = true
-		agent.Verbose = app.Config.Reporting.NewRelic.Verbose
-		agent.Run()
-
-		handler = agent.WrapHTTPHandler(handler)
+		logrus.Info("providing prometheus metrics on ", path)
+		http.Handle(path, metrics.Handler())
 	}
-
-	return handler
 }
 
 // configureLogging prepares the context with a logger using the
 // configuration.
 func configureLogging(ctx context.Context, config *configuration.Configuration) (context.Context, error) {
-	log.SetLevel(logLevel(config.Log.Level))
+	logrus.SetLevel(logLevel(config.Log.Level))
+	logrus.SetReportCaller(config.Log.ReportCaller)
 
 	formatter := config.Log.Formatter
 	if formatter == "" {
-		formatter = "text" // default formatter
+		formatter = defaultLogFormatter
 	}
 
 	switch formatter {
 	case "json":
-		log.SetFormatter(&log.JSONFormatter{
-			TimestampFormat: time.RFC3339Nano,
+		logrus.SetFormatter(&logrus.JSONFormatter{
+			TimestampFormat:   time.RFC3339Nano,
+			DisableHTMLEscape: true,
 		})
 	case "text":
-		log.SetFormatter(&log.TextFormatter{
+		logrus.SetFormatter(&logrus.TextFormatter{
 			TimestampFormat: time.RFC3339Nano,
 		})
 	case "logstash":
-		log.SetFormatter(&logstash.LogstashFormatter{
-			TimestampFormat: time.RFC3339Nano,
+		logrus.SetFormatter(&logstash.LogstashFormatter{
+			Formatter: &logrus.JSONFormatter{TimestampFormat: time.RFC3339Nano},
 		})
 	default:
-		// just let the library use default on empty string.
-		if config.Log.Formatter != "" {
-			return ctx, fmt.Errorf("unsupported logging formatter: %q", config.Log.Formatter)
-		}
+		return ctx, fmt.Errorf("unsupported logging formatter: %q", formatter)
 	}
 
-	if config.Log.Formatter != "" {
-		log.Debugf("using %q logging formatter", config.Log.Formatter)
-	}
-
+	logrus.Debugf("using %q logging formatter", formatter)
 	if len(config.Log.Fields) > 0 {
 		// build up the static fields, if present.
 		var fields []interface{}
@@ -388,43 +406,18 @@ func configureLogging(ctx context.Context, config *configuration.Configuration) 
 		ctx = dcontext.WithLogger(ctx, dcontext.GetLogger(ctx, fields...))
 	}
 
+	dcontext.SetDefaultLogger(dcontext.GetLogger(ctx))
 	return ctx, nil
 }
 
-func logLevel(level configuration.Loglevel) log.Level {
-	l, err := log.ParseLevel(string(level))
+func logLevel(level configuration.Loglevel) logrus.Level {
+	l, err := logrus.ParseLevel(string(level))
 	if err != nil {
-		l = log.InfoLevel
-		log.Warnf("error parsing level %q: %v, using %q	", level, err, l)
+		l = logrus.InfoLevel
+		logrus.Warnf("error parsing level %q: %v, using %q	", level, err, l)
 	}
 
 	return l
-}
-
-// configureBugsnag configures bugsnag reporting, if enabled
-func configureBugsnag(config *configuration.Configuration) {
-	if config.Reporting.Bugsnag.APIKey == "" {
-		return
-	}
-
-	bugsnagConfig := bugsnag.Configuration{
-		APIKey: config.Reporting.Bugsnag.APIKey,
-	}
-	if config.Reporting.Bugsnag.ReleaseStage != "" {
-		bugsnagConfig.ReleaseStage = config.Reporting.Bugsnag.ReleaseStage
-	}
-	if config.Reporting.Bugsnag.Endpoint != "" {
-		bugsnagConfig.Endpoint = config.Reporting.Bugsnag.Endpoint
-	}
-	bugsnag.Configure(bugsnagConfig)
-
-	// configure logrus bugsnag hook
-	hook, err := logrus_bugsnag.NewBugsnagHook()
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	log.AddHook(hook)
 }
 
 // panicHandler add an HTTP handler to web app. The handler recover the happening
@@ -434,7 +427,7 @@ func panicHandler(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if err := recover(); err != nil {
-				log.Panic(fmt.Sprintf("%v", err))
+				logrus.Panic(fmt.Sprintf("%v", err))
 			}
 		}()
 		handler.ServeHTTP(w, r)
